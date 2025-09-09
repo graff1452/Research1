@@ -39,10 +39,10 @@ ADAPTER_KIND = "double_seq_bn"   # "double_seq_bn" = Houlsby, "seq_bn" = Pfeiffe
 REDUCTION    = 16                 # bottleneck: hidden_dim / reduction
 NONLIN       = "relu"
 MAX_LENGTH   = 128
-BATCH_SIZE   = 8                  # fits 16GB comfortably; use grad_accum to scale
+BATCH_SIZE   = 32                  # fits 16GB comfortably; use grad_accum to scale
 GRAD_ACCUM   = 2
-EPOCHS       = 3
-LR           = 3e-4
+EPOCHS       = 5
+LR           = 1e-5
 WARMUP       = 0.1
 LOG_STEPS    = 50
 EVAL_STEPS   = 200

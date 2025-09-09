@@ -1,239 +1,334 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import time
 import json
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
-from datasets import load_dataset
 import numpy as np
+from datasets import load_dataset
 import evaluate
-from pynvml import *
 
-# Initialize NVML for GPU monitoring
-nvmlInit()
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+)
 
-# Track timing, VRAM, and power usage
-def get_gpu_usage():
-    handle = nvmlDeviceGetHandleByIndex(0)  # Get the first GPU
-    mem_info = nvmlDeviceGetMemoryInfo(handle)
-    power_usage = nvmlDeviceGetPowerUsage(handle) / 1000.0  # Convert to Watts
-    return {
-        "vram_used": mem_info.used / 1e9,  # Convert to GB
-        "vram_total": mem_info.total / 1e9,  # Convert to GB
-        "power_usage": power_usage  # Power in Watts
-    }
+# Optional NVML single snapshot (same as your LoRA script)
+try:
+    from pynvml import (
+        nvmlInit,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetPowerUsage,
+        nvmlDeviceGetMemoryInfo,
+    )
+    NVML_OK = True
+except Exception:
+    NVML_OK = False
 
-# Step 1: Load the GLUE SST-2 dataset
-print("📁 Loading GLUE SST-2 dataset...")
+print("🚀 TinyLlama SST-2 BitFit Fine-tuning")
+print("=" * 40)
+
+# ---------------------------
+# Configuration
+# ---------------------------
+MODEL_NAME   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+OUTPUT_DIR   = "./tinyllama-sst2-bitfit"
+BATCH_SIZE   = 16
+LEARNING_RATE= 3e-4
+EPOCHS       = 3
+MAX_LENGTH   = 128
+
+print("📋 Configuration:")
+print(f"   Model: {MODEL_NAME}")
+print(f"   Batch Size: {BATCH_SIZE}")
+print(f"   Learning Rate: {LEARNING_RATE}")
+print(f"   Epochs: {EPOCHS}")
+print(f"   Max length: {MAX_LENGTH}")
+
+# ---------------------------
+# Dataset
+# ---------------------------
+print("\n📁 Loading GLUE SST-2 dataset...")
 dataset = load_dataset("glue", "sst2")
+print(f"   Train samples: {len(dataset['train'])}")
+print(f"   Validation samples: {len(dataset['validation'])}")
 
-# Step 2: Load Tokenizer
-print("🤖 Loading model and tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-# Fix padding token setup
+# ---------------------------
+# Tokenizer
+# ---------------------------
+print("\n🤖 Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
+tokenizer.padding_side = "right"
 
-print(f"✅ Pad token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
-
-# Step 3: Tokenize the Dataset
-def tokenize_function(examples):
-    return tokenizer(examples["sentence"], truncation=True, padding="max_length", max_length=512)
-
-tokenized_datasets = dataset.map(tokenize_function, batched=True)
-
-# Step 4: Load the Model
-print("🤖 Loading TinyLlama model...")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🔥 Using device: {device}")
-
+# ---------------------------
+# Model
+# ---------------------------
+print("\n🧠 Loading base model...")
 model = AutoModelForSequenceClassification.from_pretrained(
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    MODEL_NAME,
     num_labels=2,
     id2label={0: "NEGATIVE", 1: "POSITIVE"},
     label2id={"NEGATIVE": 0, "POSITIVE": 1},
-    torch_dtype=torch.float32,  # Use float32 for stable training
-    device_map="auto" if torch.cuda.is_available() else None,
-    pad_token_id=tokenizer.pad_token_id  # Ensure model knows the pad token
+    pad_token_id=tokenizer.pad_token_id,
+    device_map="auto",
+)
+if hasattr(model.config, "use_cache"):
+    model.config.use_cache = False
+
+try:
+    total_params = model.num_parameters()
+except Exception:
+    total_params = sum(p.numel() for p in model.parameters())
+print("   ✓ Base model loaded")
+print(f"   📊 Total parameters: {total_params:,}")
+
+# ---------------------------
+# BitFit: freeze all; unfreeze biases + norm + classifier head
+# ---------------------------
+print("\n🪛 Applying BitFit (bias + norm + classifier head trainable)...")
+
+for p in model.parameters():
+    p.requires_grad = False
+
+# Unfreeze classifier head (usually named 'score.*')
+for name, p in model.named_parameters():
+    if name.startswith("score.") or ".score." in name:
+        p.requires_grad = True
+
+def is_bitfit_param(n: str):
+    n = n.lower()
+    return (
+        n.endswith(".bias")
+        or ".bias" in n
+        or "norm.weight" in n
+        or "rmsnorm.weight" in n
+        or ".ln_" in n  # some models use ln_ names
+    )
+
+for name, p in model.named_parameters():
+    if is_bitfit_param(name):
+        p.requires_grad = True
+
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+trainable_percentage = 100.0 * trainable_params / total_params
+print("   ✓ BitFit set")
+print(f"   📊 Trainable parameters: {trainable_params:,} ({trainable_percentage:.2f}%)")
+
+# ---------------------------
+# Tokenize (KEEP labels!)
+# ---------------------------
+print("\n🔤 Tokenizing dataset...")
+
+def tokenize_function(examples):
+    out = tokenizer(
+        examples["sentence"],
+        truncation=True,
+        padding=False,
+        max_length=MAX_LENGTH,
+    )
+    # >>> IMPORTANT: keep labels so Trainer can compute loss
+    out["labels"] = examples["label"]
+    return out
+
+tokenized = dataset.map(
+    tokenize_function,
+    batched=True,
+    remove_columns=["sentence", "idx"],  # keep label/labels
+    desc="Tokenizing",
 )
 
-# Step 5: Enhanced BitFit Implementation
-print("🔧 Applying Enhanced BitFit...")
-
-def apply_enhanced_bitfit(model):
-    trainable_params = 0
-    total_params = 0
-    
-    for name, param in model.named_parameters():
-        total_params += param.numel()
-        
-        if 'score' in name or 'classifier' in name:
-            param.requires_grad = True
-            trainable_params += param.numel()
-            print(f"✅ Training: {name} ({param.numel()} params)")
-        
-        elif 'bias' in name:
-            param.requires_grad = True
-            trainable_params += param.numel()
-            print(f"✅ Training: {name} ({param.numel()} params)")
-        
-        elif 'norm' in name.lower() or 'layer_norm' in name.lower():
-            param.requires_grad = True
-            trainable_params += param.numel()
-            print(f"✅ Training: {name} ({param.numel()} params)")
-        
-        else:
-            param.requires_grad = False
-    
-    print(f"\n📊 Training {trainable_params:,} out of {total_params:,} parameters")
-    print(f"📊 Trainable percentage: {100 * trainable_params / total_params:.2f}%")
-    
-    return trainable_params, total_params
-
-trainable_params, total_params = apply_enhanced_bitfit(model)
-
-# Step 6: Data Collator for better batching
-from transformers import DataCollatorWithPadding
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-# Step 7: Training Arguments (GPU optimized)
-training_args = TrainingArguments(
-    output_dir="./results",
-    num_train_epochs=3,
-    per_device_train_batch_size=8,  # Larger batch size
-    per_device_eval_batch_size=32,
-    gradient_accumulation_steps=4,
-    learning_rate=5e-4,
-    weight_decay=0.01,
-    warmup_steps=500,
-    save_steps=1000,
-    eval_steps=500,
-    logging_dir="./logs",
-    logging_steps=100,
-    eval_strategy="steps",
-    save_strategy="steps",
-    load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
-    greater_is_better=True,
-    dataloader_drop_last=False,
-    fp16=True,  # Enable FP16
-    bf16=False,
-    dataloader_num_workers=4,  # Increase number of workers for data loading
-    max_grad_norm=1.0,
-    report_to=None,
-    save_total_limit=3
-)
-
-
-# Step 8: Evaluation Metrics
+# ---------------------------
+# Metrics
+# ---------------------------
 accuracy_metric = evaluate.load("accuracy")
 
 def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
-    return accuracy
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    return accuracy_metric.compute(predictions=preds, references=labels)
 
-# Step 9: Create Trainer
+print("   ✓ Metrics and data collator ready")
+
+# ---------------------------
+# TrainingArguments / Trainer
+# ---------------------------
+print("\n⚙️  Building training args...")
+
+bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    learning_rate=LEARNING_RATE,
+    weight_decay=0.01,
+    warmup_ratio=0.1,
+    logging_steps=50,
+    eval_strategy="steps",      # use evaluation_strategy on older HF
+    eval_steps=200,
+    save_strategy="steps",
+    save_steps=200,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_accuracy",
+    greater_is_better=True,
+    report_to=None,
+    dataloader_drop_last=False,
+    bf16=bf16_ok,
+    gradient_checkpointing=False,
+    remove_unused_columns=True,
+    ddp_find_unused_parameters=False,
+)
+
+print("   ✓ Training arguments configured")
+
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["validation"],
-    compute_metrics=compute_metrics,
+    train_dataset=tokenized["train"],
+    eval_dataset=tokenized["validation"],
+    tokenizer=tokenizer,               # <- not processing_class
     data_collator=data_collator,
+    compute_metrics=compute_metrics,
 )
 
-# Step 10: Start Training
-print("🚀 Starting BitFit training...")
-print(f"📊 Tokenizer pad_token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
-print(f"📊 Model pad_token_id: {model.config.pad_token_id}")
+print("   ✓ Trainer created")
 
-# Initialize results dictionary
-training_results = {
-    "training_time": None,
-    "vram_usage": [],
-    "power_usage": []
+# ---------------------------
+# Pre-training eval
+# ---------------------------
+print("\n📊 Pre-training evaluation (zero-shot)...")
+pre_eval = trainer.evaluate()
+zs_acc = pre_eval.get("eval_accuracy", 0.0)
+print(f"   Zero-shot accuracy: {zs_acc:.4f} ({zs_acc*100:.2f}%)")
+
+# ---------------------------
+# Train
+# ---------------------------
+print("\n🚀 Starting BitFit fine-tuning...")
+start_time = time.time()
+train_result = trainer.train()
+training_time = time.time() - start_time
+final_train_loss = getattr(train_result, "training_loss", None)
+print("   ✅ Fine-tuning completed!")
+print(f"   ⏱️  Training time: {training_time/60:.1f} minutes")
+if final_train_loss is not None:
+    print(f"   📈 Final training loss: {final_train_loss:.4f}")
+
+# ---------------------------
+# Post-training eval
+# ---------------------------
+print("\n📊 Post-training evaluation...")
+post_eval = trainer.evaluate()
+ft_acc = post_eval.get("eval_accuracy", 0.0)
+improvement = ft_acc - zs_acc
+print(f"   Fine-tuned accuracy: {ft_acc:.4f} ({ft_acc*100:.2f}%)")
+print(f"   📈 Improvement: +{improvement:.4f} ({improvement*100:.2f} pp)")
+
+# ---------------------------
+# Save model + tokenizer
+# ---------------------------
+print("\n💾 Saving fine-tuned model...")
+trainer.save_model()
+tokenizer.save_pretrained(OUTPUT_DIR)
+print(f"   ✓ Model saved to: {OUTPUT_DIR}")
+
+# ---------------------------
+# Power & VRAM snapshot (NVML)
+# ---------------------------
+gpu_power_w = None
+gpu_vram_used_mb = None
+gpu_vram_total_mb = None
+
+if NVML_OK:
+    try:
+        nvmlInit()
+        h = nvmlDeviceGetHandleByIndex(0)
+        power = nvmlDeviceGetPowerUsage(h) / 1000.0  # Watts
+        mem = nvmlDeviceGetMemoryInfo(h)
+        gpu_power_w = float(power)
+        gpu_vram_used_mb = float(mem.used) / (1024 ** 2)
+        gpu_vram_total_mb = float(mem.total) / (1024 ** 2)
+    except Exception:
+        pass
+
+# ---------------------------
+# JSON dump
+# ---------------------------
+results = {
+    "method": "BitFit",
+    "model_name": MODEL_NAME,
+    "batch_size": BATCH_SIZE,
+    "learning_rate": LEARNING_RATE,
+    "epochs": EPOCHS,
+    "max_length": MAX_LENGTH,
+    "zero_shot_accuracy": zs_acc,
+    "fine_tuned_accuracy": ft_acc,
+    "improvement": improvement,
+    "training_time_minutes": training_time / 60.0,
+    "trainable_parameters": trainable_params,
+    "total_parameters": total_params,
+    "trainable_percentage": trainable_percentage,
+    "gpu_power_watts": gpu_power_w,
+    "gpu_vram_used_mb": gpu_vram_used_mb,
+    "gpu_vram_total_mb": gpu_vram_total_mb,
 }
 
-# Track the start time
-start_time = time.time()
+with open(f"{OUTPUT_DIR}/benchmark_results_bitfit.json", "w") as f:
+    json.dump(results, f, indent=4)
 
-# Training Loop
-try:
-    trainer.train()
-    training_results["training_time"] = time.time() - start_time  # Record training time
-    print("✅ Training completed successfully!")
-except Exception as e:
-    print(f"❌ Training failed: {e}")
-    print("💡 Common fixes:")
-    print("  - Check tokenizer padding setup")
-    print("  - Try reducing batch size")
-    print("  - Ensure GPU memory is sufficient")
-    raise e  # Re-raise to see full traceback if needed
+print(f"   ✓ Benchmark results saved to {OUTPUT_DIR}/benchmark_results_bitfit.json")
 
-# Step 11: Save the Model
-print("💾 Saving the fine-tuned model...")
-trainer.save_model("./bitfit_tinyllama_sst2")
-tokenizer.save_pretrained("./bitfit_tinyllama_sst2")
+# ---------------------------
+# Quick sample predictions
+# ---------------------------
+print("\n🎯 Testing individual predictions...")
 
-# Step 12: Final Evaluation
-print("📊 Final evaluation...")
-eval_results = trainer.evaluate()
-print("\n=== FINAL RESULTS ===")
-for key, value in eval_results.items():
-    if isinstance(value, float):
-        print(f"{key}: {value:.4f}")
-    else:
-        print(f"{key}: {value}")
-
-# Step 13: Save results in JSON
-print("💾 Saving results to JSON...")
-gpu_usage = get_gpu_usage()  # Get current GPU usage
-training_results["vram_usage"].append(gpu_usage["vram_used"])
-training_results["power_usage"].append(gpu_usage["power_usage"])
-
-# Save to JSON
-with open("training_results.json", "w") as f:
-    json.dump(training_results, f, indent=4)
-
-# Step 14: Test Predictions
-def test_prediction(text):
-    """Test a single prediction with proper device handling"""
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
-    
+def test_prediction(text, model, tokenizer):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=MAX_LENGTH)
     device = next(model.parameters()).device
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-    
-    model.eval()
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs)
-        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        predicted_class = torch.argmax(probabilities, dim=-1).item()
-    
-    label = "POSITIVE" if predicted_class == 1 else "NEGATIVE"
-    confidence = probabilities[0][predicted_class].item()
-    
-    return label, confidence
+        probs = torch.softmax(outputs.logits, dim=-1)
+        pred = torch.argmax(probs, dim=-1).item()
+    label = "POSITIVE" if pred == 1 else "NEGATIVE"
+    conf = probs[0][pred].item()
+    return label, conf
 
-# Step 15: Test Examples
 test_sentences = [
-    "This movie is absolutely fantastic!",
-    "Worst movie I've ever seen, terrible acting.",
-    "The film was okay, not great but watchable.",
-    "I loved every minute of this amazing story!",
-    "Boring and predictable plot."
+    "This movie is amazing!",
+    "I hate this boring film.",
+    "The acting was okay, nothing special.",
+    "Absolutely terrible movie, waste of time.",
+    "Outstanding performance and great story!",
+    "Boring and predictable plot.",
 ]
 
-print("\n🧪 Testing predictions:")
-print("-" * 50)
-for sentence in test_sentences:
-    try:
-        label, confidence = test_prediction(sentence)
-        print(f"Text: '{sentence}'")
-        print(f"Prediction: {label} (confidence: {confidence:.3f})")
-        print()
-    except Exception as e:
-        print(f"❌ Error testing sentence: {e}")
+print("\n--- Fine-tuned Model Predictions ---")
+for s in test_sentences:
+    label, confidence = test_prediction(s, model, tokenizer)
+    print(f"'{s}'")
+    print(f"→ {label} (confidence: {confidence:.3f})\n")
 
-print("🎉 BitFit training complete!")
+print("=" * 50)
+print("🏁 BITFIT FINE-TUNING SUMMARY")
+print("=" * 50)
+print("✅ Training completed successfully!")
+print("📊 Results:")
+print(f"   • Zero-shot accuracy: {zs_acc*100:.2f}%")
+print(f"   • Fine-tuned accuracy: {ft_acc*100:.2f}%")
+print(f"   • Improvement: +{improvement*100:.2f} percentage points")
+print(f"   • Training time: {training_time/60:.1f} minutes")
+print(f"   • Trainable parameters: {trainable_params:,} ({trainable_percentage:.2f}%)")
+print(f"💾 Model saved to: {OUTPUT_DIR}")
+print("\n🎉 BitFit fine-tuning complete!")

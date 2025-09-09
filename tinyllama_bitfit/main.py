@@ -36,9 +36,9 @@ print("=" * 40)
 # ---------------------------
 MODEL_NAME   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 OUTPUT_DIR   = "./tinyllama-sst2-bitfit"
-BATCH_SIZE   = 16
-LEARNING_RATE= 3e-4
-EPOCHS       = 3
+BATCH_SIZE   = 32
+LEARNING_RATE= 1e-5
+EPOCHS       = 5
 MAX_LENGTH   = 128
 
 print("📋 Configuration:")

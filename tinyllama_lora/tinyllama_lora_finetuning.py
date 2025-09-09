@@ -21,9 +21,9 @@ print("=" * 40)
 # Step 3: Configuration
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 OUTPUT_DIR = "./tinyllama-sst2-lora"
-BATCH_SIZE = 16  # Can use larger batch size with LoRA
-LEARNING_RATE = 3e-4  # Higher LR often works better with LoRA
-EPOCHS = 3
+BATCH_SIZE = 32  # Can use larger batch size with LoRA
+LEARNING_RATE = 1e-5  # Higher LR often works better with LoRA
+EPOCHS = 5
 
 print(f"📋 Configuration:")
 print(f"   Model: {MODEL_NAME}")
@@ -90,7 +90,7 @@ def tokenize_function(examples):
         examples["sentence"], 
         truncation=True, 
         padding=False, 
-        max_length=512
+        max_length=128
     )
 
 tokenized_datasets = dataset.map(

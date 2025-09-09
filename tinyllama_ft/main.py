@@ -30,10 +30,10 @@ print("=" * 50)
 MODEL_NAME   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 OUTPUT_DIR   = "./tinyllama-sst2-fullft"
 MAX_LENGTH   = 128
-EPOCHS       = 3
-BATCH_SIZE   = 2          # micro-batch; keep small for 16 GB
-GRAD_ACCUM   = 8          # effective batch = BATCH_SIZE * GRAD_ACCUM
-LEARNING_RATE= 2e-5
+EPOCHS       = 5
+BATCH_SIZE   = 32          # micro-batch; keep small for 16 GB
+GRAD_ACCUM   = 2          # effective batch = BATCH_SIZE * GRAD_ACCUM
+LEARNING_RATE= 1e-5
 WARMUP_RATIO = 0.1
 LOG_STEPS    = 50
 EVAL_STEPS   = 200

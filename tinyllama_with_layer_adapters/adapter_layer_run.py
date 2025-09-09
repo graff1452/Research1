@@ -1,208 +1,262 @@
+import os
 import time
-import torch
 import json
 import numpy as np
-import pynvml
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
-from datasets import load_dataset
+import torch
 import evaluate
-import adapters
-
-# Initialize GPU monitoring
-pynvml.nvmlInit()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🔥 Using device: {device}")
-
-# Function to get current VRAM usage
-def get_vram_usage():
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    return mem_info.used / 1024 ** 2  # in MB
-
-# Function to get current power usage
-def get_power_usage():
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    power = pynvml.nvmlDeviceGetPowerUsage(handle)
-    return power / 1000  # in Watts
-
-# Step 1: Load the GLUE SST-2 dataset
-print("📁 Loading GLUE SST-2 dataset...")
-dataset = load_dataset("glue", "sst2")
-
-# Step 2: Load Tokenizer
-print("🤖 Loading model and tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-# Fix padding token setup
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-
-print(f"✅ Pad token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
-
-# Step 3: Tokenize the Dataset
-def tokenize_function(examples):
-    return tokenizer(examples["sentence"], truncation=True, padding="max_length", max_length=512)
-
-tokenized_datasets = dataset.map(tokenize_function, batched=True)
-
-# Step 4: Load the Model with Adapter Configuration
-print("🤖 Loading TinyLlama model with adapters...")
-model = AutoModelForSequenceClassification.from_pretrained(
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    num_labels=2,
-    id2label={0: "NEGATIVE", 1: "POSITIVE"},
-    label2id={"NEGATIVE": 0, "POSITIVE": 1},
-    pad_token_id=tokenizer.pad_token_id
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    TrainingArguments,
+)
+from adapters import (
+    AutoAdapterModel,
+    AdapterConfig,
+    AdapterTrainer,
 )
 
-# Initialize adapter functionality
-adapters.init(model)
+# Optional power/VRAM snapshot
+try:
+    from pynvml import (
+        nvmlInit,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetPowerUsage,
+        nvmlDeviceGetMemoryInfo,
+    )
+    NVML_OK = True
+except Exception:
+    NVML_OK = False
 
-# Add adapter layer
-model.add_adapter("sst2_adapter", config="pfeiffer")
-model.train_adapter("sst2_adapter")
+print("🚀 TinyLlama SST-2 Adapter Fine-tuning")
+print("=" * 50)
 
-# Freeze all parameters except for adapter layers
-for name, param in model.named_parameters():
-    if "sst2_adapter" not in name:
-        param.requires_grad = False
+# ---- Config ----
+MODEL_NAME   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+TASK_NAME    = "sst2"
+OUTPUT_DIR   = "./tinyllama-sst2-adapters"
+ADAPTER_KIND = "double_seq_bn"   # "double_seq_bn" = Houlsby, "seq_bn" = Pfeiffer
+REDUCTION    = 16                 # bottleneck: hidden_dim / reduction
+NONLIN       = "relu"
+MAX_LENGTH   = 128
+BATCH_SIZE   = 8                  # fits 16GB comfortably; use grad_accum to scale
+GRAD_ACCUM   = 2
+EPOCHS       = 3
+LR           = 3e-4
+WARMUP       = 0.1
+LOG_STEPS    = 50
+EVAL_STEPS   = 200
+SAVE_STEPS   = 200
 
-# Step 5: Data Collator
-from transformers import DataCollatorWithPadding
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+print("📋 Configuration")
+print(f" • Model: {MODEL_NAME}")
+print(f" • Adapter: {ADAPTER_KIND} (reduction={REDUCTION}, nonlin={NONLIN})")
+print(f" • Max length: {MAX_LENGTH}")
+print(f" • BS: {BATCH_SIZE} × grad_accum {GRAD_ACCUM}  |  LR: {LR}  |  Epochs: {EPOCHS}")
 
-# Step 6: Training Arguments (GPU optimized)
-training_args = TrainingArguments(
-    output_dir="./results",       
-    num_train_epochs=3,            
-    per_device_train_batch_size=8, 
-    per_device_eval_batch_size=16, 
-    gradient_accumulation_steps=2, 
-    learning_rate=5e-4,            
-    weight_decay=0.01,
-    warmup_steps=500,
-    save_steps=1000,
-    eval_steps=500,
-    logging_dir="./logs",
-    logging_steps=100,
-    eval_strategy="steps",        
-    save_strategy="steps",       
-    load_best_model_at_end=True,  
-    metric_for_best_model="accuracy",
-    greater_is_better=True,
-    dataloader_drop_last=False,
-    fp16=False,                   
-    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-    dataloader_num_workers=0,      
-    max_grad_norm=1.0,             
-    report_to=None,               
-    save_total_limit=3             
-)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Step 7: Evaluation Metrics
-accuracy_metric = evaluate.load("accuracy")
+# ---- Data ----
+print("\n📁 Loading GLUE/SST-2…")
+raw = load_dataset("glue", "sst2")
+print(f"   Train={len(raw['train'])}, Val={len(raw['validation'])}")
+
+# ---- Tokenizer ----
+print("\n🔤 Loading tokenizer…")
+tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+    tok.pad_token_id = tok.eos_token_id
+
+def tokenize(batch):
+    enc = tok(
+        batch["sentence"],
+        truncation=True,
+        padding=False,
+        max_length=MAX_LENGTH,
+    )
+    enc["labels"] = batch["label"]  # Trainer expects 'labels'
+    return enc
+
+print("🔧 Tokenizing…")
+ds = raw.map(tokenize, batched=True, remove_columns=["sentence", "idx"])
+data_collator = DataCollatorWithPadding(tokenizer=tok)
+acc_metric = evaluate.load("accuracy")
 
 def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
-    return accuracy
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    return acc_metric.compute(predictions=preds, references=labels)
 
-# Step 8: Create Trainer
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["validation"],
-    compute_metrics=compute_metrics,
-    data_collator=data_collator,
+# ---- Model + Adapters ----
+print("\n🤖 Loading base model with adapter support…")
+bf16_ok = torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+model = AutoAdapterModel.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16 if bf16_ok else None,
+    device_map="auto"
 )
 
-# Initialize tracking variables for JSON output
-training_info = {
-    "start_time": time.time(),
-    "vram_usage_start": get_vram_usage(),
-    "power_usage_start": get_power_usage(),
-    "steps": [],
-    "total_time": 0,
-    "final_vram_usage": 0,
-    "final_power_usage": 0,
-    "final_accuracy": 0.0
-}
+# Add classification head and adapter (same name 'sst2')
+print("🧩 Adding classification head + adapter…")
+model.add_classification_head(
+    TASK_NAME,
+    num_labels=2,
+    id2label={0: "NEGATIVE", 1: "POSITIVE"},  # supported
+    # no label2id here
+)
 
-# Step 9: Start Training
-try:
-    print("🚀 Starting training with adapter layers...")
-    trainer.train()
+# (optional) also set on config for clarity/consumers:
+model.config.id2label = {0: "NEGATIVE", 1: "POSITIVE"}
+model.config.label2id = {"NEGATIVE": 0, "POSITIVE": 1}
 
-    # Log final metrics
-    training_info["total_time"] = time.time() - training_info["start_time"]
-    training_info["final_vram_usage"] = get_vram_usage()
-    training_info["final_power_usage"] = get_power_usage()
-    training_info["final_accuracy"] = trainer.evaluate()["eval_accuracy"]
+# Build adapter config: Houlsby (double_seq_bn) or Pfeiffer (seq_bn)
+adapter_cfg = AdapterConfig.load(
+    ADAPTER_KIND,
+    reduction_factor=REDUCTION,
+    non_linearity=NONLIN,
+)
+model.add_adapter(TASK_NAME, config=adapter_cfg)
+# Activate and set trainable modules
+model.set_active_adapters(TASK_NAME)   # also selects head with same name
+model.train_adapter(TASK_NAME)         # freezes base model, trains adapter + head
 
-    print("✅ Training completed successfully!")
-except Exception as e:
-    print(f"❌ Training failed: {e}")
+# Count params
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total_params     = sum(p.numel() for p in model.parameters())
+pct = 100.0 * trainable_params / total_params
+print(f"   📊 Trainable params: {trainable_params:,} / {total_params:,} ({pct:.2f}%)")
 
-# Step 10: Save the Model and Tokenizer
-print("💾 Saving the fine-tuned model with adapter...")
-trainer.save_model("./bitfit_tinyllama_sst2")
-tokenizer.save_pretrained("./bitfit_tinyllama_sst2")
+# ---- Training args ----
+print("\n⚙️  Building TrainingArguments…")
+args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    learning_rate=LR,
+    weight_decay=0.01,
+    warmup_ratio=WARMUP,
+    logging_steps=LOG_STEPS,
+    eval_strategy="steps",            # use eval_strategy in recent Transformers
+    eval_steps=EVAL_STEPS,
+    save_strategy="steps",
+    save_steps=SAVE_STEPS,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_accuracy",
+    greater_is_better=True,
+    report_to=None,
+    dataloader_drop_last=False,
+    bf16=bf16_ok,
+    remove_unused_columns=True,
+)
 
-# Step 11: Save Training Data to JSON
-print("💾 Saving training metrics to JSON...")
-with open("training_metrics.json", "w") as f:
-    json.dump(training_info, f, indent=4)
+# ---- Trainer ----
+trainer = AdapterTrainer(
+    model=model,
+    args=args,
+    train_dataset=ds["train"],
+    eval_dataset=ds["validation"],
+    tokenizer=tok,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
 
-# Step 12: Final Evaluation
-print("📊 Final evaluation...")
-eval_results = trainer.evaluate()
-print("\n=== FINAL RESULTS ===")
-for key, value in eval_results.items():
-    if isinstance(value, float):
-        print(f"{key}: {value:.4f}")
-    else:
-        print(f"{key}: {value}")
+# ---- Pre-train eval ----
+print("\n📊 Pre-training evaluation (zero-shot)…")
+pre_eval = trainer.evaluate()
+print(f"   Zero-shot accuracy: {pre_eval['eval_accuracy']:.4f} ({pre_eval['eval_accuracy']*100:.2f}%)")
 
-# Step 13: Test Predictions
-def test_prediction(text):
-    """Test a single prediction with proper device handling"""
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
-    
-    device = next(model.parameters()).device
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-    
-    model.eval()
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        predicted_class = torch.argmax(probabilities, dim=-1).item()
-    
-    label = "POSITIVE" if predicted_class == 1 else "NEGATIVE"
-    confidence = probabilities[0][predicted_class].item()
-    
-    return label, confidence
+# ---- Train ----
+print("\n🚀 Starting Adapter fine-tuning…")
+t0 = time.time()
+train_result = trainer.train()
+train_secs = time.time() - t0
+print("   ✅ Done.")
+print(f"   ⏱️  Training time: {train_secs/60:.1f} min")
+print(f"   📉 Final training loss: {train_result.training_loss:.4f}")
 
-# Step 14: Test Examples
-test_sentences = [
-    "This movie is absolutely fantastic!",
-    "Worst movie I've ever seen, terrible acting.",
-    "The film was okay, not great but watchable.",
-    "I loved every minute of this amazing story!",
-    "Boring and predictable plot."
-]
+# ---- Post eval ----
+print("\n📊 Post-training evaluation…")
+post_eval = trainer.evaluate()
+impr = post_eval["eval_accuracy"] - pre_eval["eval_accuracy"]
+print(f"   Fine-tuned accuracy: {post_eval['eval_accuracy']:.4f} ({post_eval['eval_accuracy']*100:.2f}%)")
+print(f"   📈 Improvement: +{impr:.4f} ({impr*100:.2f} pts)")
 
-print("\n🧪 Testing predictions:")
-print("-" * 50)
-for sentence in test_sentences:
+# ---- Save adapter + head ----
+print("\n💾 Saving adapter + head…")
+# Saves both the adapter weights and the matching classification head
+model.save_adapter(OUTPUT_DIR, TASK_NAME, with_head=True)  # single folder with adapter_config.json etc.
+tok.save_pretrained(OUTPUT_DIR)
+print(f"   ✓ Saved to: {OUTPUT_DIR}")
+
+# ---- Power & VRAM snapshot (single sample) ----
+power_w = vram_used_mb = vram_total_mb = None
+if NVML_OK and torch.cuda.is_available():
     try:
-        label, confidence = test_prediction(sentence)
-        print(f"Text: '{sentence}'")
-        print(f"Prediction: {label} (confidence: {confidence:.3f})")
-        print()
-    except Exception as e:
-        print(f"❌ Error testing sentence: {e}")
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(0)
+        power_w = nvmlDeviceGetPowerUsage(handle) / 1000.0
+        mem = nvmlDeviceGetMemoryInfo(handle)
+        vram_used_mb = mem.used / (1024 ** 2)
+        vram_total_mb = mem.total / (1024 ** 2)
+    except Exception:
+        pass
 
-print("🎉 Training complete!")
+# ---- JSON dump ----
+results = {
+    "method": "adapters",
+    "adapter_kind": ADAPTER_KIND,
+    "reduction_factor": REDUCTION,
+    "non_linearity": NONLIN,
+    "model_name": MODEL_NAME,
+    "max_length": MAX_LENGTH,
+    "batch_size": BATCH_SIZE,
+    "grad_accum": GRAD_ACCUM,
+    "learning_rate": LR,
+    "epochs": EPOCHS,
+    "zero_shot_accuracy": float(pre_eval["eval_accuracy"]),
+    "fine_tuned_accuracy": float(post_eval["eval_accuracy"]),
+    "improvement": float(impr),
+    "training_time_minutes": train_secs / 60.0,
+    "trainable_parameters": int(trainable_params),
+    "total_parameters": int(total_params),
+    "trainable_percentage": pct,
+    "gpu_power_watts": float(power_w) if power_w is not None else None,
+    "gpu_vram_used_mb": float(vram_used_mb) if vram_used_mb is not None else None,
+    "gpu_vram_total_mb": float(vram_total_mb) if vram_total_mb is not None else None,
+}
+with open(os.path.join(OUTPUT_DIR, "benchmark_results.json"), "w") as f:
+    json.dump(results, f, indent=4)
+print(f"   ✓ JSON saved to {OUTPUT_DIR}/benchmark_results.json")
+
+# ---- Quick predictions ----
+print("\n🎯 Sample predictions")
+def predict(text: str):
+    enc = tok(text, return_tensors="pt", truncation=True, padding=True, max_length=MAX_LENGTH)
+    enc = {k: v.to(model.device) for k, v in enc.items()}
+    with torch.no_grad():
+        out = model(**enc)
+        probs = torch.softmax(out.logits, dim=-1)[0]
+        cls = torch.argmax(probs).item()
+        label = "POSITIVE" if cls == 1 else "NEGATIVE"
+        conf = probs[cls].item()
+    return label, conf
+
+samples = [
+    "This movie is amazing!",
+    "I hate this boring film.",
+    "The acting was okay, nothing special.",
+]
+for s in samples:
+    lab, conf = predict(s)
+    print(f"'{s}' → {lab} ({conf:.3f})")
+
+print("\n🏁 ADAPTER FINE-TUNING SUMMARY")
+print(f" • Zero-shot acc: {pre_eval['eval_accuracy']*100:.2f}%")
+print(f" • Fine-tuned acc: {post_eval['eval_accuracy']*100:.2f}%")
+print(f" • +{impr*100:.2f} pts | {train_secs/60:.1f} min")
+print(f" • Trainable params: {trainable_params:,} ({pct:.2f}%)")
+print(f" • Saved to: {OUTPUT_DIR}")

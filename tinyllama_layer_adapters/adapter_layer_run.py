@@ -1,14 +1,13 @@
-import os
-import time
-import json
-import numpy as np
-import torch
-import evaluate
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os, time, json, numpy as np, torch, evaluate
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
     TrainingArguments,
+    TrainerCallback,
 )
 from adapters import (
     AutoAdapterModel,
@@ -16,7 +15,8 @@ from adapters import (
     AdapterTrainer,
 )
 
-# Optional power/VRAM snapshot
+# ---------- Optional NVML (power/VRAM) ----------
+NVML_OK = False
 try:
     from pynvml import (
         nvmlInit,
@@ -26,33 +26,44 @@ try:
     )
     NVML_OK = True
 except Exception:
-    NVML_OK = False
+    try:
+        from nvidia_ml_py import (
+            nvmlInit,
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetPowerUsage,
+            nvmlDeviceGetMemoryInfo,
+        )
+        NVML_OK = True
+    except Exception:
+        NVML_OK = False
 
-print("🚀 TinyLlama SST-2 Adapter Fine-tuning")
-print("=" * 50)
+print("🚀 TinyLlama SST-2 Adapter Fine-tuning (with checkpoint-averaged power/VRAM)")
+print("=" * 72)
 
 # ---- Config ----
 MODEL_NAME   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TASK_NAME    = "sst2"
 OUTPUT_DIR   = "./tinyllama-sst2-adapters"
-ADAPTER_KIND = "double_seq_bn"   # "double_seq_bn" = Houlsby, "seq_bn" = Pfeiffer
-REDUCTION    = 16                 # bottleneck: hidden_dim / reduction
+ADAPTER_KIND = "double_seq_bn"     # "double_seq_bn" (Houlsby) or "seq_bn" (Pfeiffer)
+REDUCTION    = 16                  # bottleneck: hidden_dim / reduction
 NONLIN       = "relu"
 MAX_LENGTH   = 128
-BATCH_SIZE   = 32                  # fits 16GB comfortably; use grad_accum to scale
+BATCH_SIZE   = 32
 GRAD_ACCUM   = 2
-EPOCHS       = 5
+EPOCHS       = 3
 LR           = 1e-5
 WARMUP       = 0.1
 LOG_STEPS    = 50
 EVAL_STEPS   = 200
 SAVE_STEPS   = 200
+GPU_INDEX    = 0
 
 print("📋 Configuration")
 print(f" • Model: {MODEL_NAME}")
 print(f" • Adapter: {ADAPTER_KIND} (reduction={REDUCTION}, nonlin={NONLIN})")
 print(f" • Max length: {MAX_LENGTH}")
 print(f" • BS: {BATCH_SIZE} × grad_accum {GRAD_ACCUM}  |  LR: {LR}  |  Epochs: {EPOCHS}")
+print(f" • NVML available: {NVML_OK}")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -67,6 +78,7 @@ tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
     tok.pad_token_id = tok.eos_token_id
+tok.padding_side = "right"
 
 def tokenize(batch):
     enc = tok(
@@ -75,7 +87,7 @@ def tokenize(batch):
         padding=False,
         max_length=MAX_LENGTH,
     )
-    enc["labels"] = batch["label"]  # Trainer expects 'labels'
+    enc["labels"] = batch["label"]
     return enc
 
 print("🔧 Tokenizing…")
@@ -94,32 +106,27 @@ bf16_ok = torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported",
 model = AutoAdapterModel.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.bfloat16 if bf16_ok else None,
-    device_map="auto"
+    device_map="auto",
 )
 
-# Add classification head and adapter (same name 'sst2')
+# Classification head + adapter (same name: TASK_NAME)
 print("🧩 Adding classification head + adapter…")
 model.add_classification_head(
     TASK_NAME,
     num_labels=2,
-    id2label={0: "NEGATIVE", 1: "POSITIVE"},  # supported
-    # no label2id here
+    id2label={0: "NEGATIVE", 1: "POSITIVE"},
 )
-
-# (optional) also set on config for clarity/consumers:
 model.config.id2label = {0: "NEGATIVE", 1: "POSITIVE"}
 model.config.label2id = {"NEGATIVE": 0, "POSITIVE": 1}
 
-# Build adapter config: Houlsby (double_seq_bn) or Pfeiffer (seq_bn)
 adapter_cfg = AdapterConfig.load(
     ADAPTER_KIND,
     reduction_factor=REDUCTION,
     non_linearity=NONLIN,
 )
 model.add_adapter(TASK_NAME, config=adapter_cfg)
-# Activate and set trainable modules
-model.set_active_adapters(TASK_NAME)   # also selects head with same name
-model.train_adapter(TASK_NAME)         # freezes base model, trains adapter + head
+model.set_active_adapters(TASK_NAME)
+model.train_adapter(TASK_NAME)  # freeze base, train adapter + head
 
 # Count params
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -127,9 +134,91 @@ total_params     = sum(p.numel() for p in model.parameters())
 pct = 100.0 * trainable_params / total_params
 print(f"   📊 Trainable params: {trainable_params:,} / {total_params:,} ({pct:.2f}%)")
 
-# ---- Training args ----
+# ---- NVML checkpoint sampler ----
+from transformers import TrainerCallback
+class CheckpointNVMLCallback(TrainerCallback):
+    """
+    Sample NVML power (W) and VRAM (MiB) at each checkpoint save; write a timeseries
+    and compute averages at train end.
+    """
+    def __init__(self, gpu_index: int = 0):
+        self.gpu_index = gpu_index
+        self.nvml_ok = False
+        self.samples_power_w = []
+        self.samples_vram_used_mb = []
+        self.timeseries = []
+        self.summary = {}
+
+    def _nvml_read(self):
+        h = nvmlDeviceGetHandleByIndex(self.gpu_index)
+        power_w = nvmlDeviceGetPowerUsage(h) / 1000.0
+        mem = nvmlDeviceGetMemoryInfo(h)
+        used_mb = float(mem.used) / (1024 ** 2)
+        total_mb = float(mem.total) / (1024 ** 2)
+        return power_w, used_mb, total_mb
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.nvml_ok = False
+        if NVML_OK:
+            try:
+                nvmlInit()
+                self.nvml_ok = True
+            except Exception:
+                self.nvml_ok = False
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self.nvml_ok:
+            return
+        try:
+            power_w, used_mb, total_mb = self._nvml_read()
+            self.samples_power_w.append(float(power_w))
+            self.samples_vram_used_mb.append(float(used_mb))
+            self.timeseries.append({
+                "global_step": int(state.global_step),
+                "power_watts": float(power_w),
+                "vram_used_mb": float(used_mb),
+                "vram_total_mb": float(total_mb),
+            })
+            # persist incrementally
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, "power_vram_timeseries.json"), "w") as f:
+                json.dump({"samples": self.timeseries}, f, indent=2)
+        except Exception:
+            pass
+
+    def on_train_end(self, args, state, control, **kwargs):
+        import statistics
+        self.summary = {
+            "avg_power_watts_over_checkpoints": (
+                float(statistics.mean(self.samples_power_w)) if self.samples_power_w else None
+            ),
+            "avg_vram_used_mb_over_checkpoints": (
+                float(statistics.mean(self.samples_vram_used_mb)) if self.samples_vram_used_mb else None
+            ),
+            "num_checkpoints_sampled": len(self.samples_power_w),
+        }
+        # append summary to file
+        try:
+            path = os.path.join(args.output_dir, "power_vram_timeseries.json")
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {"samples": []}
+            data["summary"] = self.summary
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+nvml_cb = CheckpointNVMLCallback(gpu_index=GPU_INDEX)
+
+# ---- Training args (version-compatible eval key) ----
+from packaging import version
+import transformers
+
 print("\n⚙️  Building TrainingArguments…")
-args = TrainingArguments(
+args_kwargs = dict(
     output_dir=OUTPUT_DIR,
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
@@ -139,7 +228,6 @@ args = TrainingArguments(
     weight_decay=0.01,
     warmup_ratio=WARMUP,
     logging_steps=LOG_STEPS,
-    eval_strategy="steps",            # use eval_strategy in recent Transformers
     eval_steps=EVAL_STEPS,
     save_strategy="steps",
     save_steps=SAVE_STEPS,
@@ -149,25 +237,35 @@ args = TrainingArguments(
     greater_is_better=True,
     report_to=None,
     dataloader_drop_last=False,
-    bf16=bf16_ok,
+    bf16=bool(bf16_ok),
     remove_unused_columns=True,
 )
+
+# choose right kwarg for your transformers version
+# if version.parse(transformers.__version__) >= version.parse("4.18.0"):
+#     args_kwargs["evaluation_strategy"] = "steps"
+# else:
+args_kwargs["eval_strategy"] = "steps"
+
+training_args = TrainingArguments(**args_kwargs)
 
 # ---- Trainer ----
 trainer = AdapterTrainer(
     model=model,
-    args=args,
+    args=training_args,
     train_dataset=ds["train"],
     eval_dataset=ds["validation"],
     tokenizer=tok,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
+    callbacks=[nvml_cb],
 )
 
 # ---- Pre-train eval ----
 print("\n📊 Pre-training evaluation (zero-shot)…")
 pre_eval = trainer.evaluate()
-print(f"   Zero-shot accuracy: {pre_eval['eval_accuracy']:.4f} ({pre_eval['eval_accuracy']*100:.2f}%)")
+zs_acc = float(pre_eval.get("eval_accuracy", 0.0))
+print(f"   Zero-shot accuracy: {zs_acc:.4f} ({zs_acc*100:.2f}%)")
 
 # ---- Train ----
 print("\n🚀 Starting Adapter fine-tuning…")
@@ -176,36 +274,37 @@ train_result = trainer.train()
 train_secs = time.time() - t0
 print("   ✅ Done.")
 print(f"   ⏱️  Training time: {train_secs/60:.1f} min")
-print(f"   📉 Final training loss: {train_result.training_loss:.4f}")
+print(f"   📉 Final training loss: {getattr(train_result, 'training_loss', float('nan')):.4f}")
 
 # ---- Post eval ----
 print("\n📊 Post-training evaluation…")
 post_eval = trainer.evaluate()
-impr = post_eval["eval_accuracy"] - pre_eval["eval_accuracy"]
-print(f"   Fine-tuned accuracy: {post_eval['eval_accuracy']:.4f} ({post_eval['eval_accuracy']*100:.2f}%)")
+ft_acc = float(post_eval.get("eval_accuracy", 0.0))
+impr = ft_acc - zs_acc
+print(f"   Fine-tuned accuracy: {ft_acc:.4f} ({ft_acc*100:.2f}%)")
 print(f"   📈 Improvement: +{impr:.4f} ({impr*100:.2f} pts)")
+
+# ---- Aggregate NVML stats (averaged over checkpoints) ----
+avg_power_w = avg_vram_used_mb = None
+num_ckpt_samples = 0
+if hasattr(nvml_cb, "summary"):
+    s = nvml_cb.summary or {}
+    avg_power_w = s.get("avg_power_watts_over_checkpoints")
+    avg_vram_used_mb = s.get("avg_vram_used_mb_over_checkpoints")
+    num_ckpt_samples = s.get("num_checkpoints_sampled", 0)
+
+# Optional energy estimate (Wh)
+energy_Wh = None
+if avg_power_w is not None:
+    energy_Wh = avg_power_w * (train_secs / 3600.0)
 
 # ---- Save adapter + head ----
 print("\n💾 Saving adapter + head…")
-# Saves both the adapter weights and the matching classification head
-model.save_adapter(OUTPUT_DIR, TASK_NAME, with_head=True)  # single folder with adapter_config.json etc.
+model.save_adapter(OUTPUT_DIR, TASK_NAME, with_head=True)
 tok.save_pretrained(OUTPUT_DIR)
 print(f"   ✓ Saved to: {OUTPUT_DIR}")
 
-# ---- Power & VRAM snapshot (single sample) ----
-power_w = vram_used_mb = vram_total_mb = None
-if NVML_OK and torch.cuda.is_available():
-    try:
-        nvmlInit()
-        handle = nvmlDeviceGetHandleByIndex(0)
-        power_w = nvmlDeviceGetPowerUsage(handle) / 1000.0
-        mem = nvmlDeviceGetMemoryInfo(handle)
-        vram_used_mb = mem.used / (1024 ** 2)
-        vram_total_mb = mem.total / (1024 ** 2)
-    except Exception:
-        pass
-
-# ---- JSON dump ----
+# ---- JSON dump (augmented) ----
 results = {
     "method": "adapters",
     "adapter_kind": ADAPTER_KIND,
@@ -217,20 +316,26 @@ results = {
     "grad_accum": GRAD_ACCUM,
     "learning_rate": LR,
     "epochs": EPOCHS,
-    "zero_shot_accuracy": float(pre_eval["eval_accuracy"]),
-    "fine_tuned_accuracy": float(post_eval["eval_accuracy"]),
-    "improvement": float(impr),
+    "zero_shot_accuracy": zs_acc,
+    "fine_tuned_accuracy": ft_acc,
+    "improvement": impr,
     "training_time_minutes": train_secs / 60.0,
     "trainable_parameters": int(trainable_params),
     "total_parameters": int(total_params),
     "trainable_percentage": pct,
-    "gpu_power_watts": float(power_w) if power_w is not None else None,
-    "gpu_vram_used_mb": float(vram_used_mb) if vram_used_mb is not None else None,
-    "gpu_vram_total_mb": float(vram_total_mb) if vram_total_mb is not None else None,
+
+    # Aggregated NVML metrics (averaged across checkpoint saves)
+    "avg_gpu_power_watts_over_checkpoints": avg_power_w,
+    "avg_gpu_vram_used_mb_over_checkpoints": avg_vram_used_mb,
+    "num_checkpoint_samples": num_ckpt_samples,
+
+    # Optional derived metric
+    "estimated_energy_Wh": energy_Wh,
 }
-with open(os.path.join(OUTPUT_DIR, "benchmark_results.json"), "w") as f:
+with open(os.path.join(OUTPUT_DIR, "benchmark_results_adapters.json"), "w") as f:
     json.dump(results, f, indent=4)
-print(f"   ✓ JSON saved to {OUTPUT_DIR}/benchmark_results.json")
+
+print(f"   ✓ JSON saved to {OUTPUT_DIR}/benchmark_results_adapters.json")
 
 # ---- Quick predictions ----
 print("\n🎯 Sample predictions")
@@ -245,18 +350,23 @@ def predict(text: str):
         conf = probs[cls].item()
     return label, conf
 
-samples = [
+for s in [
     "This movie is amazing!",
     "I hate this boring film.",
     "The acting was okay, nothing special.",
-]
-for s in samples:
+]:
     lab, conf = predict(s)
     print(f"'{s}' → {lab} ({conf:.3f})")
 
 print("\n🏁 ADAPTER FINE-TUNING SUMMARY")
-print(f" • Zero-shot acc: {pre_eval['eval_accuracy']*100:.2f}%")
-print(f" • Fine-tuned acc: {post_eval['eval_accuracy']*100:.2f}%")
+print(f" • Zero-shot acc: {zs_acc*100:.2f}%")
+print(f" • Fine-tuned acc: {ft_acc*100:.2f}%")
 print(f" • +{impr*100:.2f} pts | {train_secs/60:.1f} min")
+if avg_power_w is not None:
+    print(f" • Avg power over checkpoints: {avg_power_w:.2f} W (samples: {num_ckpt_samples})")
+if avg_vram_used_mb is not None:
+    print(f" • Avg VRAM used over checkpoints: {avg_vram_used_mb:.0f} MiB")
+if energy_Wh is not None:
+    print(f" • Estimated energy: {energy_Wh:.2f} Wh")
 print(f" • Trainable params: {trainable_params:,} ({pct:.2f}%)")
 print(f" • Saved to: {OUTPUT_DIR}")

@@ -1,121 +1,236 @@
-import time
-import torch
-import psutil
-import json
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import time, json, numpy as np, torch, evaluate
+from datasets import load_dataset
 from transformers import (
-    AutoTokenizer, 
+    AutoTokenizer,
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
-    DataCollatorWithPadding
+    DataCollatorWithPadding,
+    TrainerCallback,
 )
-from datasets import load_dataset
-import evaluate
-import numpy as np
+
+# ---- NVML (power/VRAM) optional imports: prefer pynvml, fallback to nvidia-ml-py ----
+NVML_OK = False
+try:
+    from pynvml import (
+        nvmlInit,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetPowerUsage,
+        nvmlDeviceGetMemoryInfo,
+    )
+    NVML_OK = True
+except Exception:
+    try:
+        from nvidia_ml_py import (
+            nvmlInit,
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetPowerUsage,
+            nvmlDeviceGetMemoryInfo,
+        )
+        NVML_OK = True
+    except Exception:
+        NVML_OK = False
+
 from peft import LoraConfig, get_peft_model, TaskType
-from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetPowerUsage, nvmlDeviceGetMemoryInfo
 
-print("🚀 TinyLlama SST-2 LoRA Fine-tuning")
-print("=" * 40)
+print("🚀 TinyLlama SST-2 LoRA Fine-tuning (with checkpoint-averaged power/VRAM)")
+print("=" * 70)
 
-# Step 3: Configuration
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-OUTPUT_DIR = "./tinyllama-sst2-lora"
-BATCH_SIZE = 32  # Can use larger batch size with LoRA
-LEARNING_RATE = 1e-5  # Higher LR often works better with LoRA
-EPOCHS = 5
+# --------------------------- Config ---------------------------
+MODEL_NAME   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+OUTPUT_DIR   = "./tinyllama-sst2-lora"
+BATCH_SIZE   = 32
+LEARNING_RATE= 1e-5       # tune if needed (LoRA often tolerates 5e-5 ~ 2e-4)
+EPOCHS       = 5
+MAX_LENGTH   = 128
+LOG_STEPS    = 50
+EVAL_STEPS   = 200
+SAVE_STEPS   = 200
+GPU_INDEX    = 0          # which GPU to sample via NVML
 
-print(f"📋 Configuration:")
+print("📋 Configuration:")
 print(f"   Model: {MODEL_NAME}")
 print(f"   Batch Size: {BATCH_SIZE}")
 print(f"   Learning Rate: {LEARNING_RATE}")
 print(f"   Epochs: {EPOCHS}")
+print(f"   NVML available: {NVML_OK}")
 
-# Step 4: Load Dataset
-print(f"\n📁 Loading GLUE SST-2 dataset...")
+# --------------------------- Dataset ---------------------------
+print("\n📁 Loading GLUE SST-2 dataset...")
 dataset = load_dataset("glue", "sst2")
 print(f"   Train samples: {len(dataset['train'])}")
 print(f"   Validation samples: {len(dataset['validation'])}")
 
-# Step 5: Load Model and Tokenizer
-print(f"\n🤖 Loading model and tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-# Add padding token if it doesn't exist
+# --------------------------- Tokenizer ---------------------------
+print("\n🤖 Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
+tokenizer.padding_side = "right"
 
-# Load base model
+# --------------------------- Base model ---------------------------
+print("\n🧠 Loading base model...")
 model = AutoModelForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=2,
     id2label={0: "NEGATIVE", 1: "POSITIVE"},
     label2id={"NEGATIVE": 0, "POSITIVE": 1},
     pad_token_id=tokenizer.pad_token_id,
-    device_map="auto"  # Automatically handle device placement
+    device_map="auto",  # let HF place modules automatically
 )
+if hasattr(model.config, "use_cache"):
+    model.config.use_cache = False
+
+try:
+    base_total_params = model.num_parameters()
+except Exception:
+    base_total_params = sum(p.numel() for p in model.parameters())
 
 print(f"   ✓ Base model loaded")
-print(f"   ✓ Model parameters: {model.num_parameters():,}")
+print(f"   📊 Base parameters: {base_total_params:,}")
 
-# Step 6: Configure LoRA
-print(f"\n🔧 Configuring LoRA...")
+# --------------------------- LoRA config ---------------------------
+print("\n🔧 Configuring LoRA...")
 lora_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,  # Sequence Classification
-    r=16,  # LoRA rank
-    lora_alpha=32,  # LoRA alpha
-    lora_dropout=0.1,  # LoRA dropout
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Target attention modules
-    bias="none",  # Don't add bias to LoRA layers
+    task_type=TaskType.SEQ_CLS,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.1,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    bias="none",
 )
 
-# Apply LoRA to model
 model = get_peft_model(model, lora_config)
 
-# Print trainable parameters
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total_params = sum(p.numel() for p in model.parameters())
-trainable_percentage = 100 * trainable_params / total_params
+total_params     = sum(p.numel() for p in model.parameters())
+trainable_pct    = 100.0 * trainable_params / total_params
 
-print(f"   ✓ LoRA applied successfully")
-print(f"   📊 Trainable parameters: {trainable_params:,} ({trainable_percentage:.2f}%)")
-print(f"   📊 Total parameters: {total_params:,}")
+print(f"   ✓ LoRA applied")
+print(f"   📊 Trainable parameters: {trainable_params:,} ({trainable_pct:.2f}%)")
+print(f"   📊 Total parameters (with LoRA): {total_params:,}")
 
-# Step 7: Tokenize Dataset
-print(f"\n🔤 Tokenizing dataset...")
+# --------------------------- Tokenize ---------------------------
+print("\n🔤 Tokenizing dataset...")
 
 def tokenize_function(examples):
-    return tokenizer(
-        examples["sentence"], 
-        truncation=True, 
-        padding=False, 
-        max_length=128
+    enc = tokenizer(
+        examples["sentence"],
+        truncation=True,
+        padding=False,
+        max_length=MAX_LENGTH,
     )
+    enc["labels"] = examples["label"]  # keep labels for Trainer
+    return enc
 
-tokenized_datasets = dataset.map(
+tokenized = dataset.map(
     tokenize_function,
     batched=True,
     remove_columns=["sentence", "idx"],
     desc="Tokenizing"
 )
-
-print(f"   ✓ Tokenization completed")
-
-# Step 8: Data Collator and Metrics
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+# --------------------------- Metrics ---------------------------
 accuracy_metric = evaluate.load("accuracy")
-
 def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    accuracy = accuracy_metric.compute(predictions=predictions, references=labels)
-    return accuracy
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    return accuracy_metric.compute(predictions=preds, references=labels)
 
-print(f"   ✓ Metrics and data collator ready")
+print("   ✓ Metrics and data collator ready")
 
-# Step 9: Training Arguments
-training_args = TrainingArguments(
+# --------------------------- NVML checkpoint sampler ---------------------------
+class CheckpointNVMLCallback(TrainerCallback):
+    """
+    Samples NVML power (W) and VRAM used (MiB) at each checkpoint save.
+    Optionally could be extended to record torch allocator peaks between checkpoints.
+    Computes means across all sampled checkpoints on train end and writes a timeseries.
+    """
+    def __init__(self, gpu_index: int = 0):
+        self.gpu_index = gpu_index
+        self.nvml_ok = False
+        self.samples_power_w = []
+        self.samples_vram_used_mb = []
+        self.timeseries = []
+        self.summary = {}
+
+    def _nvml_read(self):
+        h = nvmlDeviceGetHandleByIndex(self.gpu_index)
+        power_w = nvmlDeviceGetPowerUsage(h) / 1000.0
+        mem = nvmlDeviceGetMemoryInfo(h)
+        used_mb = float(mem.used) / (1024 ** 2)
+        total_mb = float(mem.total) / (1024 ** 2)
+        return power_w, used_mb, total_mb
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.nvml_ok = False
+        if NVML_OK:
+            try:
+                nvmlInit()
+                self.nvml_ok = True
+            except Exception:
+                self.nvml_ok = False
+
+    def on_save(self, args, state, control, **kwargs):
+        if self.nvml_ok:
+            try:
+                power_w, used_mb, total_mb = self._nvml_read()
+                self.samples_power_w.append(float(power_w))
+                self.samples_vram_used_mb.append(float(used_mb))
+                self.timeseries.append({
+                    "global_step": int(state.global_step),
+                    "power_watts": float(power_w),
+                    "vram_used_mb": float(used_mb),
+                    "vram_total_mb": float(total_mb),
+                })
+                # persist incrementally
+                import os
+                os.makedirs(args.output_dir, exist_ok=True)
+                with open(f"{args.output_dir}/power_vram_timeseries.json", "w") as f:
+                    json.dump({"samples": self.timeseries}, f, indent=2)
+            except Exception:
+                pass
+
+    def on_train_end(self, args, state, control, **kwargs):
+        import statistics, os
+        self.summary = {
+            "avg_power_watts_over_checkpoints": (
+                float(statistics.mean(self.samples_power_w)) if self.samples_power_w else None
+            ),
+            "avg_vram_used_mb_over_checkpoints": (
+                float(statistics.mean(self.samples_vram_used_mb)) if self.samples_vram_used_mb else None
+            ),
+            "num_checkpoints_sampled": len(self.samples_power_w),
+        }
+        # append summary to the timeseries file
+        try:
+            os.makedirs(args.output_dir, exist_ok=True)
+            path = f"{args.output_dir}/power_vram_timeseries.json"
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {"samples": []}
+            data["summary"] = self.summary
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+nvml_cb = CheckpointNVMLCallback(gpu_index=GPU_INDEX)
+
+# --------------------------- TrainingArguments (version-compatible) ---------------------------
+from packaging import version
+import transformers
+
+bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+args_kwargs = dict(
     output_dir=OUTPUT_DIR,
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
@@ -123,153 +238,167 @@ training_args = TrainingArguments(
     learning_rate=LEARNING_RATE,
     weight_decay=0.01,
     warmup_ratio=0.1,
-    logging_steps=50,
-    eval_strategy="steps",
-    eval_steps=200,
+    logging_steps=LOG_STEPS,
+    eval_steps=EVAL_STEPS,
     save_strategy="steps",
-    save_steps=200,
+    save_steps=SAVE_STEPS,
     save_total_limit=3,
     load_best_model_at_end=True,
     metric_for_best_model="eval_accuracy",
     greater_is_better=True,
-    report_to=None,  # Disable wandb
+    report_to=None,
     dataloader_drop_last=False,
-    bf16=True,  # Use bfloat16 instead of fp16 for better stability
-    gradient_checkpointing=False,  # Disable gradient checkpointing for LoRA
+    bf16=bool(bf16_ok),
+    fp16=bool(not bf16_ok),
+    gradient_checkpointing=False,   # typical for LoRA; can enable if you need memory
     remove_unused_columns=True,
-    ddp_find_unused_parameters=False,  # Helps with LoRA training
+    ddp_find_unused_parameters=False,
 )
 
-print(f"   ✓ Training arguments configured")
+# choose the right kwarg name for your installed transformers
+# if version.parse(transformers.__version__) >= version.parse("4.18.0"):
+#     args_kwargs["evaluation_strategy"] = "steps"
+# else:
+args_kwargs["eval_strategy"] = "steps"
 
-# Step 10: Create Trainer
+training_args = TrainingArguments(**args_kwargs)
+print("\n✓ Training arguments configured")
+
+# --------------------------- Trainer ---------------------------
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["validation"],
-    processing_class=tokenizer,
+    train_dataset=tokenized["train"],
+    eval_dataset=tokenized["validation"],
+    tokenizer=tokenizer,                 # <-- correct field (not processing_class)
     data_collator=data_collator,
     compute_metrics=compute_metrics,
+    callbacks=[nvml_cb],                 # <-- NVML sampler
 )
 
-print(f"   ✓ Trainer created")
+print("✓ Trainer created")
 
-# Step 11: Pre-training Evaluation
-print(f"\n📊 Pre-training evaluation (zero-shot)...")
+# --------------------------- Pre-training eval ---------------------------
+print("\n📊 Pre-training evaluation (zero-shot)...")
 pre_eval = trainer.evaluate()
-print(f"   Zero-shot accuracy: {pre_eval['eval_accuracy']:.4f} ({pre_eval['eval_accuracy']*100:.2f}%)")
+zs_acc = float(pre_eval.get("eval_accuracy", 0.0))
+print(f"   Zero-shot accuracy: {zs_acc:.4f} ({zs_acc*100:.2f}%)")
 
-# Step 12: Start Fine-tuning
-print(f"\n🚀 Starting LoRA fine-tuning...")
-print(f"   This will take approximately 10-20 minutes...")
-
-start_time = time.time()
+# --------------------------- Train ---------------------------
+print("\n🚀 Starting LoRA fine-tuning...")
+t0 = time.time()
 train_result = trainer.train()
-training_time = time.time() - start_time
+train_secs = time.time() - t0
+final_train_loss = getattr(train_result, "training_loss", None)
+print("   ✅ Fine-tuning completed!")
+print(f"   ⏱️  Training time: {train_secs/60:.1f} minutes")
+if final_train_loss is not None:
+    print(f"   📈 Final training loss: {final_train_loss:.4f}")
 
-print(f"   ✅ Fine-tuning completed!")
-print(f"   ⏱️  Training time: {training_time/60:.1f} minutes")
-print(f"   📈 Final training loss: {train_result.training_loss:.4f}")
-
-# Step 13: Post-training Evaluation
-print(f"\n📊 Post-training evaluation...")
+# --------------------------- Post-training eval ---------------------------
+print("\n📊 Post-training evaluation...")
 post_eval = trainer.evaluate()
-print(f"   Fine-tuned accuracy: {post_eval['eval_accuracy']:.4f} ({post_eval['eval_accuracy']*100:.2f}%)")
+ft_acc = float(post_eval.get("eval_accuracy", 0.0))
+improvement = ft_acc - zs_acc
+print(f"   Fine-tuned accuracy: {ft_acc:.4f} ({ft_acc*100:.2f}%)")
+print(f"   📈 Improvement: +{improvement:.4f} ({improvement*100:.2f} pp)")
 
-# Calculate improvement
-improvement = post_eval['eval_accuracy'] - pre_eval['eval_accuracy']
-print(f"   📈 Improvement: +{improvement:.4f} ({improvement*100:.2f} percentage points)")
+# --------------------------- Aggregate NVML stats ---------------------------
+avg_power_w = avg_vram_used_mb = None
+num_ckpt_samples = 0
+if hasattr(nvml_cb, "summary"):
+    s = nvml_cb.summary or {}
+    avg_power_w = s.get("avg_power_watts_over_checkpoints")
+    avg_vram_used_mb = s.get("avg_vram_used_mb_over_checkpoints")
+    num_ckpt_samples = s.get("num_checkpoints_sampled", 0)
 
-# Step 14: Save Model
-print(f"\n💾 Saving fine-tuned model...")
+# optional energy estimate (Wh)
+energy_Wh = None
+if avg_power_w is not None:
+    energy_Wh = avg_power_w * (train_secs / 3600.0)
+
+# --------------------------- Save model ---------------------------
+print("\n💾 Saving fine-tuned model...")
 trainer.save_model()
 tokenizer.save_pretrained(OUTPUT_DIR)
 print(f"   ✓ Model saved to: {OUTPUT_DIR}")
 
-# Step 15: Power and VRAM Consumption
-# Initialize NVIDIA Management Library for power usage
-nvmlInit()
-handle = nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
-
-# Get power and VRAM usage
-def get_gpu_metrics():
-    power = nvmlDeviceGetPowerUsage(handle) / 1000  # Convert to Watts
-    memory_info = nvmlDeviceGetMemoryInfo(handle)
-    vram_used = memory_info.used / (1024 ** 2)  # Convert to MB
-    vram_total = memory_info.total / (1024 ** 2)  # Convert to MB
-    return power, vram_used, vram_total
-
-# Monitor during training
-power, vram_used, vram_total = get_gpu_metrics()
-
-# Step 16: Save Results to JSON
+# --------------------------- JSON dump ---------------------------
 results = {
+    "method": "LoRA",
     "model_name": MODEL_NAME,
     "batch_size": BATCH_SIZE,
     "learning_rate": LEARNING_RATE,
     "epochs": EPOCHS,
-    "zero_shot_accuracy": pre_eval["eval_accuracy"],
-    "fine_tuned_accuracy": post_eval["eval_accuracy"],
+    "max_length": MAX_LENGTH,
+    "zero_shot_accuracy": zs_acc,
+    "fine_tuned_accuracy": ft_acc,
     "improvement": improvement,
-    "training_time_minutes": training_time / 60,
-    "trainable_parameters": trainable_params,
-    "total_parameters": total_params,
-    "trainable_percentage": trainable_percentage,
-    "gpu_power_watts": power,  # Power in Watts
-    "gpu_vram_used_mb": vram_used,  # VRAM used in MB
-    "gpu_vram_total_mb": vram_total,  # Total VRAM in MB
+    "training_time_minutes": train_secs / 60.0,
+    "trainable_parameters": int(trainable_params),
+    "total_parameters": int(total_params),
+    "trainable_percentage": float(trainable_pct),
+
+    # Aggregated NVML metrics (averaged across all checkpoint saves)
+    "avg_gpu_power_watts_over_checkpoints": avg_power_w,
+    "avg_gpu_vram_used_mb_over_checkpoints": avg_vram_used_mb,
+    "num_checkpoint_samples": num_ckpt_samples,
+
+    # Optional derived metric
+    "estimated_energy_Wh": energy_Wh,
 }
 
-# Save the results to a JSON file
-with open(f"{OUTPUT_DIR}/benchmark_results.json", "w") as f:
+with open(f"{OUTPUT_DIR}/benchmark_results_lora.json", "w") as f:
     json.dump(results, f, indent=4)
 
-print(f"   ✓ Benchmark results saved to {OUTPUT_DIR}/benchmark_results.json")
+print(f"   ✓ Benchmark results saved to {OUTPUT_DIR}/benchmark_results_lora.json")
+print(f"   ✓ Per-checkpoint timeseries saved to {OUTPUT_DIR}/power_vram_timeseries.json")
 
-# Step 17: Test Individual Predictions
-print(f"\n🎯 Testing individual predictions...")
+# --------------------------- Test predictions ---------------------------
+print("\n🎯 Testing individual predictions...")
 
 def test_prediction(text, model, tokenizer):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=MAX_LENGTH)
     device = next(model.parameters()).device
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-    
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs)
-        predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        predicted_class = torch.argmax(predictions, dim=-1).item()
-    
-    label = "POSITIVE" if predicted_class == 1 else "NEGATIVE"
-    confidence = predictions[0][predicted_class].item()
-    return label, confidence
+        probs = torch.softmax(outputs.logits, dim=-1)
+        pred = torch.argmax(probs, dim=-1).item()
+    label = "POSITIVE" if pred == 1 else "NEGATIVE"
+    conf = probs[0][pred].item()
+    return label, conf
 
 test_sentences = [
     "This movie is amazing!",
     "I hate this boring film.",
-    "The acting was okay, nothing special.", 
+    "The acting was okay, nothing special.",
     "Absolutely terrible movie, waste of time.",
     "Outstanding performance and great story!",
-    "Boring and predictable plot."
+    "Boring and predictable plot.",
 ]
 
-print(f"\n--- Fine-tuned Model Predictions ---")
-for sentence in test_sentences:
-    label, confidence = test_prediction(sentence, model, tokenizer)
-    print(f"'{sentence}'")
+print("\n--- Fine-tuned Model Predictions ---")
+for s in test_sentences:
+    label, confidence = test_prediction(s, model, tokenizer)
+    print(f"'{s}'")
     print(f"→ {label} (confidence: {confidence:.3f})\n")
 
-# Final Summary
-print("=" * 50)
+print("=" * 70)
 print("🏁 LORA FINE-TUNING SUMMARY")
-print("=" * 50)
+print("=" * 70)
 print(f"✅ Training completed successfully!")
 print(f"📊 Results:")
-print(f"   • Zero-shot accuracy: {pre_eval['eval_accuracy']*100:.2f}%")
-print(f"   • Fine-tuned accuracy: {post_eval['eval_accuracy']*100:.2f}%") 
+print(f"   • Zero-shot accuracy: {zs_acc*100:.2f}%")
+print(f"   • Fine-tuned accuracy: {ft_acc*100:.2f}%")
 print(f"   • Improvement: +{improvement*100:.2f} percentage points")
-print(f"   • Training time: {training_time/60:.1f} minutes")
-print(f"   • Trainable parameters: {trainable_params:,} ({trainable_percentage:.2f}%)")
+print(f"   • Training time: {train_secs/60:.1f} minutes")
+print(f"   • Trainable parameters: {trainable_params:,} ({trainable_pct:.2f}%)")
+if avg_power_w is not None:
+    print(f"   • Avg power over checkpoints: {avg_power_w:.2f} W (samples: {num_ckpt_samples})")
+if avg_vram_used_mb is not None:
+    print(f"   • Avg VRAM used over checkpoints: {avg_vram_used_mb:.0f} MiB")
+if energy_Wh is not None:
+    print(f"   • Estimated energy: {energy_Wh:.2f} Wh")
 print(f"💾 Model saved to: {OUTPUT_DIR}")
-
-print(f"\n🎉 LoRA fine-tuning complete!")
+print("\n🎉 LoRA fine-tuning complete!")

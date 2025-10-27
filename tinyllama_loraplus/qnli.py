@@ -20,12 +20,12 @@ try:
 except Exception:
     BNB_OK = False
 
-print("🚀 TinyLlama CoLA LoRA+ Fine-tuning (with JSON & NVML like sample)")
+print("🚀 TinyLlama QNLI LoRA+ Fine-tuning (with JSON & NVML-like sampling)")
 print("=" * 70)
 
 # --------------------------- Config ---------------------------
 MODEL_NAME     = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-OUTPUT_DIR     = "./tinyllama-cola-loraplus"     # CHANGED
+OUTPUT_DIR     = "./tinyllama-qnli-loraplus"
 BATCH_SIZE     = 32
 LEARNING_RATE  = 1e-5
 EPOCHS         = 3
@@ -38,6 +38,7 @@ LORAPLUS_RATIO = 16   # LR_B = ratio * LR_A
 
 print("📋 Configuration:")
 print(f"   Model: {MODEL_NAME}")
+print(f"   Task: GLUE/QNLI")
 print(f"   Batch Size: {BATCH_SIZE}")
 print(f"   Learning Rate: {LEARNING_RATE} (LoRA+ ratio={LORAPLUS_RATIO})")
 print(f"   Epochs: {EPOCHS}")
@@ -67,8 +68,8 @@ except Exception:
 print(f"   NVML available: {NVML_OK}")
 
 # --------------------------- Dataset ---------------------------
-print("\n📁 Loading GLUE CoLA dataset...")       # CHANGED
-dataset = load_dataset("glue", "cola")           # CHANGED
+print("\n📁 Loading GLUE QNLI dataset...")
+dataset = load_dataset("glue", "qnli")
 print(f"   Train samples: {len(dataset['train'])}")
 print(f"   Validation samples: {len(dataset['validation'])}")
 
@@ -82,11 +83,14 @@ tokenizer.padding_side = "right"
 
 # --------------------------- Base model ---------------------------
 print("\n🧠 Loading base model...")
+# QNLI labels: 0 = ENTAILMENT, 1 = NOT_ENTAILMENT
+id2label = {0: "ENTAILMENT", 1: "NOT_ENTAILMENT"}
+label2id = {"ENTAILMENT": 0, "NOT_ENTAILMENT": 1}
 model = AutoModelForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=2,
-    id2label={0: "UNACCEPTABLE", 1: "ACCEPTABLE"},  # CHANGED
-    label2id={"UNACCEPTABLE": 0, "ACCEPTABLE": 1},  # CHANGED
+    id2label=id2label,
+    label2id=label2id,
     pad_token_id=tokenizer.pad_token_id,
     device_map="auto",
 )
@@ -123,8 +127,10 @@ print(f"   📊 Total parameters (with LoRA): {total_params:,}")
 # --------------------------- Tokenize ---------------------------
 print("\n🔤 Tokenizing dataset...")
 def tokenize_function(examples):
+    # QNLI is a sentence-pair task: (question, sentence)
     enc = tokenizer(
-        examples["sentence"],            # CHANGED: CoLA uses "sentence"
+        examples["question"],
+        examples["sentence"],
         truncation=True,
         padding=False,
         max_length=MAX_LENGTH,
@@ -135,17 +141,17 @@ def tokenize_function(examples):
 tokenized = dataset.map(
     tokenize_function,
     batched=True,
-    remove_columns=["sentence", "idx"],  # CHANGED
+    remove_columns=["question", "sentence", "idx"],  # keep original 'label' or drop; unused cols are removed by Trainer
     desc="Tokenizing"
 )
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-# --------------------------- Metrics (CoLA uses MCC) ---------------------------
-mcc_metric = evaluate.load("matthews_correlation")  # CHANGED
+# --------------------------- Metrics ---------------------------
+accuracy_metric = evaluate.load("accuracy")
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=1)
-    return mcc_metric.compute(predictions=preds, references=labels)
+    return accuracy_metric.compute(predictions=preds, references=labels)
 
 print("   ✓ Metrics and data collator ready")
 
@@ -195,7 +201,7 @@ class CheckpointNVMLCallback(TrainerCallback):
                 pass
 
     def on_train_end(self, args, state, control, **kwargs):
-        import statistics, os
+        import statistics
         self.summary = {
             "avg_power_watts_over_checkpoints": (
                 float(statistics.mean(self.samples_power_w)) if self.samples_power_w else None
@@ -240,13 +246,13 @@ args_kwargs = dict(
     save_steps=SAVE_STEPS,
     save_total_limit=3,
     load_best_model_at_end=True,
-    metric_for_best_model="eval_matthews_correlation",  # CHANGED
+    metric_for_best_model="eval_accuracy",
     greater_is_better=True,
     report_to=None,
     dataloader_drop_last=False,
     bf16=bool(bf16_ok),
     fp16=bool(not bf16_ok),
-    gradient_checkpointing=False,
+    gradient_checkpointing=False,   # can enable if memory is tight
     remove_unused_columns=True,
     ddp_find_unused_parameters=False,
 )
@@ -271,7 +277,7 @@ def build_manual_loraplus_param_groups(model, lr, ratio):
         elif "lora_B" in n:
             b_params.append(p)
         else:
-            rest.append(p)
+            rest.append(p)  # classifier head etc., if any
     groups = [
         {"params": a_params, "lr": lr},
         {"params": b_params, "lr": lr * ratio},
@@ -321,11 +327,11 @@ print("✓ Trainer created")
 # --------------------------- Pre-training eval ---------------------------
 print("\n📊 Pre-training evaluation (zero-shot)...")
 pre_eval = trainer.evaluate()
-zs_mcc = float(pre_eval.get("eval_matthews_correlation", 0.0))  # CHANGED
-print(f"   Zero-shot MCC: {zs_mcc:.4f}")
+zs_acc = float(pre_eval.get("eval_accuracy", 0.0))
+print(f"   Zero-shot accuracy: {zs_acc:.4f} ({zs_acc*100:.2f}%)")
 
 # --------------------------- Train ---------------------------
-print("\n🚀 Starting LoRA+ fine-tuning (CoLA)...")
+print("\n🚀 Starting LoRA+ fine-tuning (QNLI)…")
 t0 = time.time()
 train_result = trainer.train()
 train_secs = time.time() - t0
@@ -338,10 +344,10 @@ if final_train_loss is not None:
 # --------------------------- Post-training eval ---------------------------
 print("\n📊 Post-training evaluation...")
 post_eval = trainer.evaluate()
-ft_mcc = float(post_eval.get("eval_matthews_correlation", 0.0))  # CHANGED
-improvement = ft_mcc - zs_mcc
-print(f"   Fine-tuned MCC: {ft_mcc:.4f}")
-print(f"   📈 Improvement: +{improvement:.4f}")
+ft_acc = float(post_eval.get("eval_accuracy", 0.0))
+improvement = ft_acc - zs_acc
+print(f"   Fine-tuned accuracy: {ft_acc:.4f} ({ft_acc*100:.2f}%)")
+print(f"   📈 Improvement: +{improvement:.4f} ({improvement*100:.2f} pp)")
 
 # --------------------------- Aggregate NVML stats ---------------------------
 avg_power_w = avg_vram_used_mb = None
@@ -365,15 +371,15 @@ print(f"   ✓ Model saved to: {OUTPUT_DIR}")
 # --------------------------- JSON dump ---------------------------
 results = {
     "method": "LoRA+",
-    "task": "GLUE-CoLA",                 # CHANGED
+    "task": "GLUE-QNLI",
     "model_name": MODEL_NAME,
     "batch_size": BATCH_SIZE,
     "learning_rate": LEARNING_RATE,
     "epochs": EPOCHS,
     "max_length": MAX_LENGTH,
-    "zero_shot_mcc": zs_mcc,            # CHANGED fields
-    "fine_tuned_mcc": ft_mcc,
-    "improvement_mcc": improvement,
+    "zero_shot_accuracy": zs_acc,
+    "fine_tuned_accuracy": ft_acc,
+    "improvement": improvement,
     "training_time_minutes": train_secs / 60.0,
     "trainable_parameters": int(trainable_params),
     "total_parameters": int(total_params),
